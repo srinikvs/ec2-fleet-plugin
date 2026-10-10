@@ -124,6 +124,7 @@ public class EC2FleetCloud extends AbstractEC2FleetCloud {
     private final Integer initOnlineCheckIntervalSec;
     private final Integer cloudStatusIntervalSec;
     private final Integer maxTotalUses;
+    private boolean terminateOnConnectionFailure;
 
     /**
      * @see EC2FleetAutoResubmitComputerLauncher
@@ -134,6 +135,7 @@ public class EC2FleetCloud extends AbstractEC2FleetCloud {
      * @see NoDelayProvisionStrategy
      */
     private final boolean noDelayProvision;
+
     private List<CloudEnvironmentVariable> environmentVariables = Collections.emptyList();
 
     /**
@@ -242,6 +244,15 @@ public class EC2FleetCloud extends AbstractEC2FleetCloud {
 
     public boolean isDisableTaskResubmit() {
         return disableTaskResubmit;
+    }
+
+    public boolean isTerminateOnConnectionFailure() {
+        return terminateOnConnectionFailure;
+    }
+
+    @DataBoundSetter
+    public void setTerminateOnConnectionFailure(final boolean terminateOnConnectionFailure) {
+        this.terminateOnConnectionFailure = terminateOnConnectionFailure;
     }
 
     public List<CloudEnvironmentVariable> getEnvironmentVariables() {
@@ -587,17 +598,27 @@ public class EC2FleetCloud extends AbstractEC2FleetCloud {
     /**
      * Returns whether the given {@link Computer} is safe to terminate, i.e. not running any builds and
      * not available for the queue to dispatch new work to. A null computer is treated as safe, since
-     * the node is already gone from Jenkins.
+     * the node is already gone from Jenkins. Callers must not use that for a node that still exists.
      * <p>
-     * Callers scheduling a termination are expected to first mark the computer as not accepting tasks
-     * (see {@link EC2RetentionStrategy} and {@link EC2FleetNodeComputer#doDoDelete()}), so that the
-     * queue cannot bind new work to it between the check here and the call to terminate on EC2.
+     * Callers scheduling a termination are expected to first suspend the computer
+     * (see {@link EC2FleetNodeComputer#suspendForTermination(EC2AgentTerminationReason, boolean)}),
+     * so that the queue cannot bind new work to it between this check and the EC2 terminate call.
      */
     private static boolean isSafeToTerminate(final Computer c) {
         if (c == null) return true;
-        if (c.countBusy() > 0) return false;
+        if (c.countBusy() > 0 || !c.isIdle()) return false;
         if (c.isAcceptingTasks()) return false;
-        return c.isIdle();
+        // isIdle/countBusy can miss a work unit that is assigned but not yet reflected in those counters.
+        final List<Executor> executors = c.getAllExecutors();
+        if (executors != null) {
+            for (final Executor executor : executors) {
+                if (executor == null) continue;
+                if (executor.getCurrentExecutable() != null || executor.getCurrentWorkUnit() != null) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     public boolean removePlannedNodeScheduledFutures(final int numToRemove) {
@@ -638,11 +659,21 @@ public class EC2FleetCloud extends AbstractEC2FleetCloud {
                     while (it.hasNext()) {
                         final Map.Entry<String, EC2AgentTerminationReason> entry = it.next();
                         final String instanceId = entry.getKey();
-                        if (!isSafeToTerminate(jenkins.getComputer(instanceId))) {
+                        final Computer computer = jenkins.getComputer(instanceId);
+                        final Node node = jenkins.getNode(instanceId);
+                        // A live node with no computer is not proof that nothing is running on it.
+                        // Drop it for this cycle instead of treating the missing computer as idle (issue #586).
+                        if (computer == null && node != null) {
+                            warning(
+                                    "Skipping termination of instance '%s' because its Jenkins node exists but has no computer.",
+                                    instanceId);
                             it.remove();
                             continue;
                         }
-                        final Node node = jenkins.getNode(instanceId);
+                        if (!isSafeToTerminate(computer)) {
+                            it.remove();
+                            continue;
+                        }
                         if (node != null) {
                             try {
                                 jenkins.removeNode(node);
@@ -682,11 +713,13 @@ public class EC2FleetCloud extends AbstractEC2FleetCloud {
                 if (asgFleet.hasWarmPoolWithInstanceReuse(awsCredentialsId, region, endpoint, fleet)) {
                     // Warm pool with instance reuse: hand instances back to the ASG so it can reuse them.
                     fine("Scaling down AutoScalingGroup with warm pool: %s", currentInstanceIdsToTerminate.keySet());
-                    asgFleet.scaleDownWithWarmPool(awsCredentialsId, region, endpoint, fleet, currentInstanceIdsToTerminate);
+                    asgFleet.scaleDownWithWarmPool(
+                            awsCredentialsId, region, endpoint, fleet, currentInstanceIdsToTerminate);
                 } else {
                     // No warm pool: terminate instances directly so the ASG replaces them.
                     fine("Terminating instances in AutoScalingGroup: %s", currentInstanceIdsToTerminate.keySet());
-                    asgFleet.terminateInstances(awsCredentialsId, region, endpoint, currentInstanceIdsToTerminate.keySet());
+                    asgFleet.terminateInstances(
+                            awsCredentialsId, region, endpoint, currentInstanceIdsToTerminate.keySet());
                 }
             } else {
                 fine("Terminating instances: %s", currentInstanceIdsToTerminate.keySet());
@@ -790,11 +823,7 @@ public class EC2FleetCloud extends AbstractEC2FleetCloud {
                         try {
                             addNewAgent(ec2, instance, updatedState);
                         } catch (final Exception ex) {
-                            warning(
-                                    ex,
-                                    "Unable to add new agent for instance '%s': %s",
-                                    instance.instanceId(),
-                                    ex);
+                            warning(ex, "Unable to add new agent for instance '%s': %s", instance.instanceId(), ex);
                         }
                     }
                 }
@@ -853,6 +882,13 @@ public class EC2FleetCloud extends AbstractEC2FleetCloud {
         instanceIdsToTerminate.put(instanceId, reason);
         fine("InstanceIdsToTerminate: %s", instanceIdsToTerminate);
         return true;
+    }
+
+    @Override
+    public synchronized boolean isTerminationScheduled(final String instanceId) {
+        return instanceId != null
+                && instanceIdsToTerminate != null
+                && instanceIdsToTerminate.containsKey(instanceId);
     }
 
     @Override
